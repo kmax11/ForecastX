@@ -1,0 +1,21 @@
+@import url("https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&display=swap");
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  color-scheme: light;
+}
+
+body {
+  font-family: "Inter", system-ui, -apple-system, "Segoe UI", sans-serif;
+  background: #f7f7f7;
+  color: #0f172a;
+}
+
+/* glass card helper */
+.glass {
+  background: linear-gradient(160deg, rgba(255,255,255,.08), rgba(255,255,255,.04));
+  border: 1px solid rgba(255,255,255,.08);
+  backdrop-filter: blur(12px);
+}
