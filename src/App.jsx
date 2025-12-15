@@ -1,9 +1,47 @@
 import { useEffect, useMemo, useState } from "react";
 
-const API_KEY = import.meta.env.VITE_OPENWEATHER_API_KEY;
-const ICON_BASE = "https://openweathermap.org/img/wn/";
+// Open-Meteo requires no API key. We'll query by latitude/longitude.
+// Simple caches to reduce API calls (TTL: 10 minutes). Weather and geocode results are persisted to localStorage.
+const CACHE_TTL_MS = 10 * 60 * 1000;
+// Minimum gap between network calls per coordinate to avoid hammering the API
+const MIN_REQUEST_INTERVAL_MS = 15 * 1000;
+const STORAGE_VERSION = "v1"; // bump to invalidate old cache shape
+const weatherCache = loadCacheFromStorage("weatherCache"); // key: `${lat},${lon}`, value: { data, ts }
+const requestLog = new Map(); // key: `${lat},${lon}`, value: last request timestamp
+const geocodeCache = loadCacheFromStorage("geocodeCache"); // key: query(lowercase), value: { data, ts }
 
-const initialCity = "London";
+const initialCoords = { lat: 52.52, lon: 13.41 }; // Berlin
+
+function loadCacheFromStorage(name) {
+  if (typeof window === "undefined") return new Map();
+  try {
+    const raw = localStorage.getItem(`${STORAGE_VERSION}:${name}`);
+    if (!raw) return new Map();
+    const parsed = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return new Map();
+    const map = new Map();
+    parsed.forEach(([k, v]) => {
+      if (v?.ts && Date.now() - v.ts < CACHE_TTL_MS * 2) {
+        map.set(k, v);
+      }
+    });
+    return map;
+  } catch (err) {
+    return new Map();
+  }
+}
+
+function persistCache(map, name, maxEntries = 12) {
+  if (typeof window === "undefined") return;
+  const entries = Array.from(map.entries())
+    .sort((a, b) => (b[1]?.ts ?? 0) - (a[1]?.ts ?? 0))
+    .slice(0, maxEntries);
+  try {
+    localStorage.setItem(`${STORAGE_VERSION}:${name}`, JSON.stringify(entries));
+  } catch (err) {
+    // Ignore storage errors (quota, private mode)
+  }
+}
 
 function formatTemperature(value) {
   return `${Math.round(value)}°C`;
@@ -17,40 +55,155 @@ function clamp(value, min, max) {
   return Math.min(Math.max(value, min), max);
 }
 
-async function fetchWeather(city) {
-  if (!API_KEY) {
-    throw new Error("Missing API key. Add VITE_OPENWEATHER_API_KEY to .env");
+async function fetchCoordsByName(name) {
+  const trimmed = name.trim();
+  if (!trimmed) throw new Error("Enter a city or address to search.");
+  const key = trimmed.toLowerCase();
+  const cached = geocodeCache.get(key);
+  if (cached && Date.now() - cached.ts < CACHE_TTL_MS) {
+    return cached.data;
   }
-  const url = new URL("https://api.openweathermap.org/data/2.5/weather");
-  url.searchParams.set("q", city);
-  url.searchParams.set("appid", API_KEY);
-  url.searchParams.set("units", "metric");
 
-  const res = await fetch(url.toString());
+  const url = new URL("https://geocoding-api.open-meteo.com/v1/search");
+  url.searchParams.set("name", trimmed);
+  url.searchParams.set("count", "1");
+  url.searchParams.set("language", "en");
+  url.searchParams.set("format", "json");
+
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 8000);
+  let res;
+  try {
+    res = await fetch(url.toString(), { signal: controller.signal });
+  } catch (err) {
+    clearTimeout(timeout);
+    if (err.name === "AbortError") {
+      throw new Error("Geocoding timed out. Please try again.");
+    }
+    throw new Error("Network error while searching for that place.");
+  }
+  clearTimeout(timeout);
+
   if (!res.ok) {
-    const message = res.status === 404 ? "City not found" : "Unable to fetch weather";
-    throw new Error(message);
+    throw new Error("Unable to search for that place.");
   }
   const data = await res.json();
-  return {
-    city: `${data.name}, ${data.sys.country}`,
-    temp: data.main.temp,
-    humidity: data.main.humidity,
-    description: data.weather?.[0]?.description ?? "-",
-    icon: data.weather?.[0]?.icon ?? "",
+  const first = data.results?.[0];
+  if (!first) {
+    throw new Error("No matches found. Try another place or add more detail.");
+  }
+
+  const normalized = {
+    lat: first.latitude,
+    lon: first.longitude,
+    label: `${first.name}${first.admin1 ? `, ${first.admin1}` : ""}, ${first.country_code}`,
   };
+  geocodeCache.set(key, { data: normalized, ts: Date.now() });
+  persistCache(geocodeCache, "geocodeCache");
+  return normalized;
+}
+
+async function fetchWeatherByCoords(lat, lon) {
+  const key = `${lat},${lon}`;
+  const cached = weatherCache.get(key);
+  if (cached && Date.now() - cached.ts < CACHE_TTL_MS) {
+    return cached.data;
+  }
+
+  const now = Date.now();
+  const lastRequest = requestLog.get(key) ?? 0;
+  const elapsed = now - lastRequest;
+  if (elapsed < MIN_REQUEST_INTERVAL_MS) {
+    const waitSeconds = Math.ceil((MIN_REQUEST_INTERVAL_MS - elapsed) / 1000);
+    throw new Error(`Please wait ~${waitSeconds}s before retrying this location.`);
+  }
+
+  const url = new URL("https://api.open-meteo.com/v1/forecast");
+  url.searchParams.set("latitude", String(lat));
+  url.searchParams.set("longitude", String(lon));
+  url.searchParams.set("current_weather", "true");
+
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 8000);
+  let res;
+  try {
+    res = await fetch(url.toString(), { signal: controller.signal });
+  } catch (err) {
+    clearTimeout(timeout);
+    if (err.name === "AbortError") {
+      throw new Error("Request timed out. Please try again.");
+    }
+    throw new Error("Network error while fetching weather.");
+  }
+  clearTimeout(timeout);
+
+  if (!res.ok) {
+    throw new Error("Unable to fetch weather");
+  }
+  const data = await res.json();
+  const cw = data.current_weather || {};
+  const normalized = {
+    location: { lat: data.latitude, lon: data.longitude },
+    temp: cw.temperature,
+    windspeed: cw.windspeed,
+    winddirection: cw.winddirection,
+    weathercode: cw.weathercode,
+    time: cw.time,
+    humidity: data.hourly?.relativehumidity_2m?.[0] ?? null, // may be null if not requested
+    description: mapWeatherCode(cw.weathercode),
+  };
+  weatherCache.set(key, { data: normalized, ts: Date.now() });
+  persistCache(weatherCache, "weatherCache");
+  requestLog.set(key, Date.now());
+  return normalized;
+}
+
+function mapWeatherCode(code) {
+  const table = {
+    0: "Clear sky",
+    1: "Mainly clear",
+    2: "Partly cloudy",
+    3: "Overcast",
+    45: "Fog",
+    48: "Depositing rime fog",
+    51: "Light drizzle",
+    53: "Moderate drizzle",
+    55: "Dense drizzle",
+    56: "Light freezing drizzle",
+    57: "Dense freezing drizzle",
+    61: "Slight rain",
+    63: "Moderate rain",
+    65: "Heavy rain",
+    66: "Light freezing rain",
+    67: "Heavy freezing rain",
+    71: "Slight snow",
+    73: "Moderate snow",
+    75: "Heavy snow",
+    77: "Snow grains",
+    80: "Slight rain showers",
+    81: "Moderate rain showers",
+    82: "Violent rain showers",
+    85: "Slight snow showers",
+    86: "Heavy snow showers",
+    95: "Thunderstorm",
+    96: "Thunderstorm with slight hail",
+    99: "Thunderstorm with heavy hail",
+  };
+  return table[code] ?? "-";
 }
 
 export default function App() {
-  const [query, setQuery] = useState(initialCity);
+  const [query, setQuery] = useState("Berlin");
+  const [lat, setLat] = useState(initialCoords.lat);
+  const [lon, setLon] = useState(initialCoords.lon);
+  const [locationLabel, setLocationLabel] = useState("Berlin, DE");
   const [weather, setWeather] = useState(null);
   const [status, setStatus] = useState("idle");
-  const [message, setMessage] = useState("Type a city to get started.");
+  const [message, setMessage] = useState("Search a city or address to get started.");
 
-  const hasKey = useMemo(() => Boolean(API_KEY), []);
   const chanceBars = useMemo(() => {
     if (!weather) return [];
-    const base = clamp(weather.humidity ?? 40, 5, 95);
+    const base = clamp((weather.humidity ?? 40), 5, 95);
     return [
       { label: "09 am", value: clamp(base * 0.65, 5, 95) },
       { label: "12 pm", value: clamp(base * 0.8, 5, 95) },
@@ -71,10 +224,10 @@ export default function App() {
   }, [weather]);
 
   useEffect(() => {
-    if (!query.trim()) {
+    if (Number.isNaN(lat) || Number.isNaN(lon)) {
       setWeather(null);
       setStatus("idle");
-      setMessage("Type a city to search.");
+      setMessage("Enter a valid place.");
       return;
     }
 
@@ -83,10 +236,12 @@ export default function App() {
 
     const handle = setTimeout(async () => {
       try {
-        const data = await fetchWeather(query.trim());
+        const data = await fetchWeatherByCoords(lat, lon);
         setWeather(data);
         setStatus("success");
-        setMessage(`Showing weather for ${data.city}.`);
+        setMessage(
+          locationLabel ? `Showing weather for ${locationLabel}.` : `Showing weather for lat ${lat}, lon ${lon}.`
+        );
       } catch (error) {
         setWeather(null);
         setStatus("error");
@@ -95,42 +250,40 @@ export default function App() {
     }, 450);
 
     return () => clearTimeout(handle);
-  }, [query]);
-
-  const iconUrl = weather?.icon ? `${ICON_BASE}${weather.icon}@2x.png` : "";
+  }, [lat, lon, locationLabel]);
 
   return (
     <div className="min-h-screen bg-[#f7f7f7] text-slate-900">
       <div className="mx-auto flex max-w-3xl flex-col gap-6 px-4 py-10">
         <header className="flex flex-col gap-2 text-center">
           <p className="text-xs uppercase tracking-[0.25em] text-slate-500">Weather</p>
-          <h1 className="text-3xl font-semibold">City Conditions</h1>
-          <p className="text-sm text-slate-500">Live data powered by OpenWeatherMap</p>
+          <h1 className="text-3xl font-semibold">Current Conditions</h1>
+          <p className="text-sm text-slate-500">Live data powered by Open‑Meteo</p>
         </header>
-
-        {!hasKey && (
-          <div className="rounded-2xl border border-amber-300 bg-amber-50 px-4 py-3 text-sm text-amber-800">
-            Add your API key in a `.env` file as `VITE_OPENWEATHER_API_KEY=YOUR_KEY` and restart the dev server.
-          </div>
-        )}
 
         <div className="rounded-3xl border border-slate-200 bg-white p-5 shadow-sm">
           <form
             className="flex flex-col gap-3 sm:flex-row"
-            onSubmit={(e) => {
+            onSubmit={async (e) => {
               e.preventDefault();
-              setQuery((prev) => prev.trim());
+              setStatus("loading");
+              setMessage("Searching location...");
+              try {
+                const result = await fetchCoordsByName(query);
+                setLat(result.lat);
+                setLon(result.lon);
+                setLocationLabel(result.label);
+              } catch (error) {
+                setStatus("error");
+                setMessage(error.message);
+              }
             }}
           >
-            <label className="sr-only" htmlFor="city-input">
-              Search city
-            </label>
             <div className="flex w-full items-center gap-2 rounded-2xl border border-slate-200 bg-slate-50 px-3 py-2">
               <span className="text-slate-500">🔍</span>
               <input
-                id="city-input"
                 className="w-full bg-transparent text-base text-slate-900 placeholder:text-slate-400 outline-none"
-                placeholder="Search city..."
+                placeholder="Search city or address (e.g., Paris)"
                 value={query}
                 onChange={(e) => setQuery(e.target.value)}
                 autoComplete="off"
@@ -160,15 +313,12 @@ export default function App() {
             <div className="flex flex-col items-start justify-between gap-3 sm:flex-row sm:items-center">
               <div className="space-y-1">
                 <p className="text-sm text-slate-500">Current location</p>
-                <h2 className="text-2xl font-semibold">{weather.city}</h2>
+                <h2 className="text-2xl font-semibold">
+                  {locationLabel || `lat ${weather.location.lat}, lon ${weather.location.lon}`}
+                </h2>
                 <p className="text-sm capitalize text-slate-500">{weather.description}</p>
               </div>
               <div className="flex items-center gap-3">
-                {iconUrl ? (
-                  <img src={iconUrl} alt={weather.description} className="h-16 w-16" />
-                ) : (
-                  <div className="h-16 w-16 rounded-full bg-slate-100" />
-                )}
                 <div className="text-5xl font-semibold leading-none text-slate-900">
                   {formatTemperature(weather.temp)}
                 </div>
@@ -177,8 +327,10 @@ export default function App() {
 
             <div className="grid grid-cols-1 gap-3 sm:grid-cols-3">
               <Highlight label="Temperature" value={formatTemperature(weather.temp)} />
-              <Highlight label="Humidity" value={formatHumidity(weather.humidity)} />
-              <Highlight label="Feels like" value={formatTemperature(weather.temp)} />
+              {weather.humidity != null && (
+                <Highlight label="Humidity" value={formatHumidity(weather.humidity)} />
+              )}
+              <Highlight label="Wind" value={`${Math.round(weather.windspeed)} km/h`} />
             </div>
 
             <div className="space-y-2">

@@ -1,6 +1,6 @@
 # Weather App (React + Vite + Tailwind)
 
-Live city weather powered by OpenWeatherMap. Search any city to see temperature, humidity, and conditions with an icon.
+Current weather powered by Open‑Meteo. Search by city/address to see temperature, wind, and conditions — no signup or API key required.
 
 ## Setup
 
@@ -10,9 +10,10 @@ Live city weather powered by OpenWeatherMap. Search any city to see temperature,
 npm install
 ```
 
-2. Add your API key:
+2. Configure (optional):
 
-- Copy `.env.example` to `.env` and set `VITE_OPENWEATHER_API_KEY` to your OpenWeatherMap key.
+- No API key needed. The app uses Open‑Meteo.
+- Default search is Berlin. You can type any city or address (geocoding via Open‑Meteo) and it will fetch the matching coordinates.
 
 3. Run locally:
 
@@ -24,6 +25,6 @@ Open the printed local URL (typically `http://localhost:5173`).
 
 ## Notes
 
-- Uses async/await with a small debounce on search input.
-- Icons come directly from OpenWeatherMap (`openweathermap.org/img/wn`).
-- Tailwind classes power the responsive layout and glassmorphic card styling.
+- Uses async/await with a small debounce on searches and caching to avoid spamming the API.
+- Weather codes are mapped to human‑readable descriptions.
+- Tailwind classes power the responsive layout and card styling.
