@@ -17,4 +17,3 @@ pnpm-lock.yaml
 dist/
 build/
 .temp/
-.tmp/
